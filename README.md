@@ -53,8 +53,8 @@ The bot uses PostgreSQL with these tables:
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yourusername/cinemate-bot.git
-   cd cinemate-bot
+   git clone https://github.com/yourusername/telegram_bot.git
+   cd telegram_bot
    ```
 
 2. **Install dependencies**
