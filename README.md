@@ -45,11 +45,6 @@ Cinemate Bot is a Telegram bot that allows users to request movies by making pay
    DATABASE=postgresql://username:password@localhost:5432/dbname
    ```
 
-5. Initialize the database:
-   ```bash
-   python JoeMovieBot.py
-   ```
-
 ### Running the Bot
 ```bash
 python JoeMovieBot.py
