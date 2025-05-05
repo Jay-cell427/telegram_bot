@@ -22,8 +22,8 @@ Cinemate Bot is a Telegram bot that allows users to request movies by making pay
 ### Installation
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/cinemate-bot.git
-   cd cinemate-bot
+   git clone https://github.com/Jay-cell427/telegram_bot.git
+   cd telegram_-bot
    ```
 
 2. Create and activate a virtual environment:
