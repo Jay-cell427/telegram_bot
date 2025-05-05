@@ -1,98 +1,96 @@
-# CineMate Bot 🎥🤖
+# 🎬 Cinemate Bot - Movie Request System
 
-A Telegram bot for managing and delivering movie requests with file upload support.
+## 📝 Description
+Cinemate Bot is a Telegram bot that allows users to request movies by making payments. The bot handles user requests, payment processing, and movie delivery through a secure and organized system. Admins can manage movie uploads and track user requests.
 
-## Features ✨
+## ✨ Features
+- User-friendly interface with interactive buttons
+- Secure payment processing
+- Database storage for user information and payment history
+- Admin panel for managing movie uploads
+- Automatic notifications for users and admins
+- Support for both document and text-based movie uploads
 
-- **User-friendly interface** with `/start` command and interactive buttons
-- **Admin panel** for managing movie deliveries
-- **File upload support** for videos, documents, photos, and audio
-- **Database integration** with PostgreSQL for tracking users and payments
-- **Admin commands** for managing content delivery
-- **Automatic restart** on crashes for maximum uptime
+## 🛠️ Setup Instructions
 
-## Commands 🛠️
+### Prerequisites
+- Python 3.7+
+- PostgreSQL database
+- Telegram bot token from [@BotFather](https://t.me/BotFather)
+- Payment provider token (if using Telegram Payments)
 
-### User Commands
--`/start` - Start interacting with the bot
-- `/help` - Show help message
-- `/support` - Contact support
-
-### Admin Commands
-- `/addmovie <payment_id> <file_id> "<file_name>" <file_type>` - Add a movie file to a payment
-- `/panel` - Admin control panel
-- `/checkfiles` - View file delivery status
-- `/getpayments` - View recent payments
-- `/admin` - Verify admin status
-
-## Database Schema 🗃️
-
-The bot uses PostgreSQL with these tables:
-
-### `users` table
-- `user_id` (BIGINT PRIMARY KEY)
-- `username` (TEXT)
-- `first_name` (TEXT)
-- `last_name` (TEXT)
-- `join_date` (TIMESTAMP)
-- `last_active` (TIMESTAMP)
-
-### `payments` table
-- `payment_id` (TEXT PRIMARY KEY)
-- `user_id` (BIGINT REFERENCES users)
-- `amount` (INTEGER)
-- `currency` (TEXT)
-- `status` (TEXT)
-- `request_timestamp` (TIMESTAMP)
-- `completion_timestamp` (TIMESTAMP)
-- `file_id` (TEXT)
-- `file_name` (TEXT)
-- `file_type` (TEXT)
-
-## Setup Instructions ⚙️
-
-1. **Clone the repository**
+### Installation
+1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/telegram_bot.git
-   cd telegram_bot
+   git clone https://github.com/yourusername/cinemate-bot.git
+   cd cinemate-bot
    ```
 
-2. **Install dependencies**
+2. Create and activate a virtual environment:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # Linux/Mac
+   venv\Scripts\activate    # Windows
+   ```
+
+3. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
 
-3. **Set up environment variables**
-   Create a `.env` file with:
+4. Create a `.env` file with the following variables:
    ```
    TOKEN=your_telegram_bot_token
-   DATABASE=your_postgres_connection_string
+   ADMIN_ID=your_telegram_user_id
+   DATABASE=postgresql://username:password@localhost:5432/dbname
    ```
 
-4. **Run the bot**
+5. Initialize the database:
    ```bash
-   python JoeMovieBotFree.py
+   python JoeMovieBot.py
    ```
 
-## Configuration ⚙️
+### Running the Bot
+```bash
+python JoeMovieBot.py
+```
 
-Edit `config.py` to set:
-- `ADMIN_ID` - Your Telegram user ID
-- Environment variables in `.env` file:
-  - `TOKEN` - Your Telegram bot token
-  - `DATABASE` - PostgreSQL connection string
+## 🤖 Bot Commands
 
-## Requirements 📦
+### User Commands
+- `/start` - Start interacting with the bot
+- `/help` - Show help message
+- `/request` - Request a movie
+- `/mystatus` - Check your pending requests
+- `/support` - Contact support
 
-- Python 3.7+
-- `python-dotenv`
-- `psycopg2-binary`
-- `pyTelegramBotAPI`
+### Admin Commands
+- `/addmovie` - Add a movie to a payment
+- `/stats` - View bot statistics
+- `/panel` - Admin control panel
 
-## License 📄
+## 📊 Database Structure
+The bot uses PostgreSQL with the following tables:
 
+### `users` Table
+- Stores user information (ID, username, name, join date)
+
+### `payments` Table
+- Tracks payment information with movie file metadata
+- Includes payment status and timestamps
+
+## 🔧 Configuration
+Modify `config.py` to:
+- Add additional environment variables
+- Change logging settings
+- Adjust database connection parameters
+
+## 📜 License
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 📬 Support
+For issues or feature requests, please open an issue on GitHub.
 
 ---
 
-Enjoy using Cinemate Bot! For support, contact the developer. 🚀
+Enjoy using Cinemate Bot! 🍿🎥
