@@ -1,31 +1,65 @@
 import os
 from dotenv import load_dotenv
-import sys
-import logging
-from typing import Optional
+from typing import List
 
-# Configure basic logging for config loading issues
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Load environment variables from .env file
 load_dotenv()
 
-def get_env_var(var_name: str, default: Optional[str] = None, required: bool = False, var_type: type = str) -> any:
-    """Helper function to get, validate, and type-cast environment variables."""
-    value = os.getenv(var_name, default)
-    if required and value is None:
-        logger.critical(f"❌ Missing required environment variable: {var_name}")
-        sys.exit(f"Error: Environment variable {var_name} is required but not set.")
-    if value is not None:
-        try:
-            return var_type(value)
-        except ValueError:
-            logger.critical(f"❌ Invalid type for environment variable: {var_name}. Expected {var_type.__name__}, got '{value}'")
-            sys.exit(f"Error: Invalid type for environment variable {var_name}.")
-    return value # Return None if not required and not set
+class Config:
+    # Telegram
+    TOKEN = os.getenv('TOKEN')
+    ADMIN_ID = int(os.getenv('ADMIN_ID', 0))
+    ADMIN_CHANNEL_ID = os.getenv('ADMIN_CHANNEL_ID')
+    ADVERTISING_CHANNEL = os.getenv('ADVERTISING_CHANNEL')
+    ADVERTISING_CHANNEL_INVITE_LINK = os.getenv('ADVERTISING_CHANNEL_INVITE_LINK')
+    ADVERTISING_CHANNEL_ID = os.getenv('ADVERTISING_CHANNEL_ID')
+    
+    # Database
+    DB_NAME = os.getenv('DB_NAME')
+    DB_USER = os.getenv('DB_USER')
+    DB_PASSWORD = os.getenv('DB_PASSWORD')
+    DB_HOST = os.getenv('DB_HOST')
+    DB_PORT = os.getenv('DB_PORT')
+    
+    DATABASE = f"dbname='{DB_NAME}' user='{DB_USER}' " \
+               f"password='{DB_PASSWORD}' host='{DB_HOST}' " \
+               f"port='{DB_PORT}'"
+    
+    # Payments
+    PAYMENT_PROVIDER_TOKEN = os.getenv('PAYMENT_PROVIDER_TOKEN')
+    CURRENCY = os.getenv('CURRENCY')
+    PRICE_AMOUNT = int(os.getenv('PRICE_AMOUNT', 1))
+    
+    # System
+    REQUEST_EXPIRY_HOURS = int(os.getenv('REQUEST_EXPIRY_HOURS', 24))
+    MEMBERSHIP_CHECK_INTERVAL = int(os.getenv('MEMBERSHIP_CHECK_INTERVAL', 86400))
+    CLEANUP_INTERVAL = int(os.getenv('CLEANUP_INTERVAL', 3600))
+    
+    GOOGLE_DRIVE_CREDENTIALS_PATH = os.getenv('GOOGLE_DRIVE_CREDENTIALS_PATH')
+    GOOGLE_DRIVE_CONTENT_FOLDER_ID = os.getenv('GOOGLE_DRIVE_CONTENT_FOLDER_ID')
+    
+    @staticmethod
+    def validate():
+        required = {
+            'Telegram': ['TOKEN', 'ADMIN_ID', 'ADMIN_CHANNEL_ID', 'ADVERTISING_CHANNEL', 'ADVERTISING_CHANNEL_INVITE_LINK'],
+            'Database': ['DB_NAME', 'DB_USER', 'DB_PASSWORD', 'DB_HOST', 'DB_PORT'],
+            'Payments': ['PAYMENT_PROVIDER_TOKEN']
+        }
+        
+        errors = []
+        for category, vars in required.items():
+            for var in vars:
+                if not getattr(Config, var):
+                    errors.append(f"{category} - {var}")
+        
+        if errors:
+            raise EnvironmentError(
+                "Missing required configuration:\n" +
+                "\n".join(errors) +
+                "\n\nPlease check your .env file"
+            )
 
-ADMIN_ID: int = get_env_var('ADMIN_ID', required=True, var_type=int) # Get ADMIN_ID from env
-TOKEN: str = get_env_var('TOKEN', required=True)
-DATABASE: str = get_env_var('DATABASE', required=True)
-# Add other necessary variables like DB pool size if using pooling in database.py
+try:
+    Config.validate()
+except EnvironmentError as e:
+    print(f"❌ Configuration error: {e}")
+    exit(1)
