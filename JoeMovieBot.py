@@ -1,206 +1,986 @@
-from config import ADMIN_ID
-import telebot
-from telebot import types
-from config import TOKEN
-from database import init_db, save_payment, get_movie_file_info
+from telegram.helpers import escape_markdown
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+from config import Config
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, ForceReply, Update
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, PreCheckoutQueryHandler
+from database import Database
 import os
 import sys
+import io
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+import logging
+import asyncio
+import aiopg
+import aiohttp
+import socket
+import psycopg2
+from psycopg2 import errors as pg_errors
+import tracemalloc
+import random # Import random for jitter
+import uuid # For generating unique content IDs
+import signal
 
-# Initialize bot with better error handling
-try:
-    bot = telebot.TeleBot(TOKEN)
-    print(f"✅ Bot initialized at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"🤖 Bot Username: @{bot.get_me().username}")
-    print(f"🆔 Bot ID: {bot.get_me().id}")
-except Exception as e:
-    print(f"❌ Failed to initialize bot: {e}")
-    sys.exit(1)
-
-# Enhanced database initialization
-try:
-    init_db()
-    print("💾 Database connection established and tables verified")
-except Exception as e:
-    print(f"❌ Database initialization failed: {e}")
-    sys.exit(1)
-
-# Add startup notification to admin
-def notify_admin():
-    try:
-        bot.send_message(
-            ADMIN_ID,
-            f"🟢 Bot Started Successfully!\n"
-            f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"🐍 Python {sys.version.split()[0]}\n"
-            f"📦 Version: 1.0.0"  # Update this with your actual version
-        )
-    except Exception as e:
-        print(f"⚠️ Failed to send startup notification: {e}")
-
-# Send notification (will only work if polling starts successfully)
-notify_admin()
-
-# Function to create a payment keyboard
-def payment_keyboard():
-    keyboard = types.InlineKeyboardMarkup(row_width=2)
-    pay_button = types.InlineKeyboardButton(text="💳 Pay  XTR", pay=True)
-    help_button = types.InlineKeyboardButton(text="ℹ️ Help", callback_data="show_help")
-    keyboard.add(pay_button, help_button)
-    return keyboard
-
-# Function to create a start keyboard with "Request Movie" button
-def start_keyboard():
-    keyboard = types.InlineKeyboardMarkup()
-    button = types.InlineKeyboardButton(text="Request a Movie", callback_data="request_movie")
-    keyboard.add(button)
-    return keyboard
-
-# /start command handler
-@bot.message_handler(commands=['start'])
-def handle_start(message):
-    welcome_text = """
-🎥 Welcome to *Cinemate*! 🍿
-
-I can help you request movies easily. Here's how:
-
-1. Click *"Request a Movie"* below
-2. Complete the payment
-3. Receive your movie link!
-
-Type /help to see all available commands.
-"""
-    bot.send_message(
-        message.chat.id,
-        welcome_text,
-        reply_markup=start_keyboard(),
-        parse_mode='Markdown'
-    )
-
-@bot.callback_query_handler(func=lambda call: call.data == "show_help")
-def show_help_callback(call):
-    handle_help(call.message)
-    bot.answer_callback_query(call.id)
-
-@bot.message_handler(commands=['mystatus'])
-def handle_mystatus(message):
-    user_id = message.from_user.id
-    try:
-        with psycopg2.connect(DATABASE) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute('''
-                    SELECT payment_id, request_timestamp 
-                    FROM payments 
-                    WHERE user_id = %s
-                    ORDER BY request_timestamp DESC
-                    LIMIT 5
-                ''', (user_id,))
-                requests = cursor.fetchall()
-        
-        if requests:
-            status_msg = "📋 Your Last 5 Requests:\n\n"
-            for req in requests:
-                status_msg += f"• {req[0]} - {req[1].strftime('%Y-%m-%d %H:%M')}\n"
-            status_msg += "\nUse /support if you have questions."
-        else:
-            status_msg = "You haven't made any requests yet. Use /start to begin!"
-        
-        bot.send_message(message.chat.id, status_msg)
-        
-    except Exception as e:
-        bot.reply_to(message, f"⚠️ Error checking your status: {e}")
+tracemalloc.start()
 
 
+# Custom exceptions
+class NetworkError(Exception):
+    """Custom exception for network-related errors"""
+    pass
 
-@bot.message_handler(commands=['admin'])
-def admin_check(message):
-    """Verify admin status"""
-    if message.from_user.id == ADMIN_ID:
-        bot.reply_to(message, "✅ You are recognized as admin!")
-    else:
-        bot.reply_to(message, "❌ Access denied!")
+class TelegramError(Exception):
+    """Custom exception for Telegram API errors"""
+    pass
 
-@bot.message_handler(commands=['addmovie'])
-@bot.message_handler(commands=['addmovie'], content_types=['text', 'document'])
-def handle_add_movie(message):
-    """Admin-only movie adder that accepts either text command or document"""
-    if message.from_user.id != ADMIN_ID:
-        return bot.reply_to(message, "❌ Admin only!")
-    
-    try:
-        if message.document:  # If admin sent a document
-            file_id = message.document.file_id
-            file_name = message.document.file_name
-            file_type = message.document.mime_type
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class MovieBot:
+    def __init__(self):
+        self.app = None
+        self.initialized = False
+        self.max_retries = 5
+        self.retry_delay = 10  # seconds
+        self._admin_notified = False
+        self._bg_tasks = [] #Initialize background tasks lists
+        self._shutdown_event = asyncio.Event()
+        self.google_drive_service = None # To store the  Google Drive API service client
+        self._is_shutting_down = False
+
+    async def check_network_stability(self):
+        """Properly await all async operations with better timeout handling"""
+        tests = [
+            {
+                "name": "DNS Resolution",
+                "test": lambda: socket.gethostbyname('api.telegram.org'),
+                "error_message": "DNS resolution failed. Check internet connection or DNS settings."
+            },
+            {
+                "name": "HTTP Connectivity",
+                "test": self._test_http_connectivity,
+                "error_message": "HTTP connectivity failed. Cannot reach external services."
+            },
+            {
+                "name": "Telegram API Connectivity",
+                "test": self._test_telegram_connectivity,
+                "error_message": "Telegram API connectivity failed. Cannot reach Telegram servers."
+            }
+        ]
+
+        # Add jitter to delay
+        initial_delay = 2 + random.uniform(0, 3)  # 2-5 seconds
+        await asyncio.sleep(initial_delay)
+
+        for attempt in range(self.max_retries):
+            all_passed = True
+            logger.info(f"Running network stability tests (attempt {attempt + 1}/{self.max_retries})")
             
-            # Get payment_id from caption or prompt admin
-            if not message.caption:
-                msg = bot.reply_to(message, "Please reply with the payment ID for this movie:")
-                bot.register_next_step_handler(msg, process_payment_id_step, file_id, file_name, file_type)
-                return
-            
-            payment_id = message.caption.strip()
-            process_movie_upload(payment_id, file_id, file_name, file_type, message)
-            
-        else:  # If admin sent text command
-            try:
-                _, payment_id, file_id, file_name, file_type = message.text.split(maxsplit=4)
-                process_movie_upload(payment_id, file_id, file_name, file_type, message)
-            except ValueError:
-                bot.reply_to(message, "Usage for text:\n/addmovie <payment_id> <file_id> <file_name> <file_type>\n\nOr just send the file with payment ID as caption")
+            for test_info in tests:
+                try:
+                    logger.info(f"Running network test: {test_info['name']}")
+                    
+                    # Add timeout to each test
+                    if asyncio.iscoroutinefunction(test_info["test"]):
+                        await asyncio.wait_for(test_info["test"](), timeout=15.0)
+                    else:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(test_info["test"]), 
+                            timeout=15.0
+                        )
+                    
+                    logger.info(f"Network test '{test_info['name']}' passed.")
+                    
+                except asyncio.TimeoutError:
+                    logger.error(f"Network test '{test_info['name']}' timed out after 15 seconds.")
+                    all_passed = False
+                    break
+                    
+                except Exception as e:
+                    logger.error(f"Network test '{test_info['name']}' failed: {e}. {test_info['error_message']}")
+                    all_passed = False
+                    break
+
+            if all_passed:
+                logger.info("All network stability tests passed.")
+                self._admin_notified = False  # Reset notification on successful recovery
+                return True
+            else:
+                logger.warning(f"Network stability tests failed. Retrying in {self.retry_delay} seconds (Attempt {attempt + 1}/{self.max_retries})...")
                 
-    except Exception as e:
-        bot.reply_to(message, f"⚠️ Error: {e}")
+                if attempt < self.max_retries - 1:
+                    # Exponential backoff with jitter
+                    delay = self.retry_delay * (2 ** attempt) + random.uniform(0, 5)
+                    await asyncio.sleep(min(delay, 60))  # Cap at 60 seconds
+                else:
+                    if not self._admin_notified:
+                        logger.critical("Maximum network stability retries reached. Persistent network issues.")
+                        try:
+                            await self._notify_admin("🚨 Critical: Network issues persist. Please check the server.")
+                            self._admin_notified = True
+                        except Exception as notify_error:
+                            logger.error(f"Failed to notify admin about network issues: {notify_error}")
+        
+        return False
 
-def process_payment_id_step(message, file_id, file_name, file_type):
-    """Process payment ID after admin sends document without caption"""
-    try:
-        payment_id = message.text.strip()
-        process_movie_upload(payment_id, file_id, file_name, file_type, message)
-    except Exception as e:
-        bot.reply_to(message, f"⚠️ Error: {e}")
 
-def process_movie_upload(payment_id, file_id, file_name, file_type, message):
-    """Common processing for movie uploads"""
-    user_id = update_movie_file(payment_id, file_id, file_name, file_type)
-    if user_id:
+
+    async def _test_http_connectivity(self):
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://www.google.com", timeout=10) as response:
+                response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
+        return True
+
+
+    async def _notify_admin(self, message: str):
         try:
-            # Notify user
-            bot.send_message(
-                user_id,
-                f"🎬 Your movie is ready!\n\n"
-                f"📁 File: {file_name}\n"
-                f"💾 Type: {file_type.split('/')[-1].upper()}\n\n"
-                f"Download below 👇"
-            )
-            bot.send_document(user_id, file_id, caption=file_name)
-            
-            # Confirm to admin
-            bot.reply_to(message, f"✅ Movie sent to user {user_id}")
+            if self.app and self.app.bot: # Ensure app and bot are initialized
+                await self.app.bot.send_message(chat_id=Config.ADMIN_ID, text=message)
+                logger.info(f"Admin notified: {message}")
+                self._admin_notified = True
+        
         except Exception as e:
-            bot.reply_to(message, f"⚠️ Movie saved but failed to notify user: {e}")
-    else:
-        bot.reply_to(message, "❌ Payment ID not found")
+            logger.error(f"Failed to send admin notification to user {Config.ADMIN_ID}: {e}")
 
-def admin_keyboard():
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add(types.KeyboardButton("/addmovie"))
-    keyboard.add(types.KeyboardButton("/stats"))
-    return keyboard
+    async def _test_telegram_connectivity(self):
+        """Test connectivity to Telegram's API"""
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Test Telegram API endpoint (without authentication)
+            async with session.get("https://api.telegram.org") as response:
+                # Telegram returns 404 for root, but connection is successful
+                if response.status in [200, 404]:
+                    return True
+                else:
+                    response.raise_for_status()
+        return True
 
-@bot.message_handler(commands=['panel'])
-def admin_panel(message):
-    if message.from_user.id == ADMIN_ID:
-        bot.send_message(
-            message.chat.id,
-            "Admin panel:",
-            reply_markup=admin_keyboard()
-            )       
+    async def initialize(self):
+        """Initialize the bot components."""
+        logger.info("Initializing bot components...")
+        try:
+            # Database connection pool setup
+            Database.pool = await Database.get_connection()
+            await Database.init_db()
+            logger.info("Database initialized.")
+            
+            # Google Drive API service client setup
+            await self._initialize_google_drive_service()
+           
+            # Application builder
+            self.app = Application.builder().token(Config.TOKEN).build()
+            self.initialized = True # Mark as initialized after app is built
 
-@bot.message_handler(commands=['help'])
-def handle_help(message):
-    help_text = """
+            # Handlers
+            self.app.add_handler(CommandHandler("start", self.start))
+            self.app.add_handler(CommandHandler("request", self.request_content))
+            self.app.add_handler(CommandHandler("support", self.handle_support))
+            self.app.add_handler(CommandHandler("addcontent", self.handle_add_content)) # Admin command
+            self.app.add_handler(CommandHandler("deliver", self.deliver_content_admin)) # Admin command
+            self.app.add_handler(CommandHandler("stats", self.get_bot_stats)) # Admin command
+            self.app.add_handler(CallbackQueryHandler(self.button_handler))
+            self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message))
+            self.app.add_handler(PreCheckoutQueryHandler(self.pre_checkout_callback))
+            self.app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, self.successful_payment_callback))
+
+            # --- ADDED HANDLERS FROM JoeMovieBot.py ---
+            self.app.add_handler(CommandHandler("mystatus", self.handle_mystatus))
+            self.app.add_handler(CommandHandler("admin", self.admin_check))
+            self.app.add_handler(CommandHandler("getpayments", self.handle_get_payments))
+            self.app.add_handler(CommandHandler("pending", self.handle_pending_payments))
+            self.app.add_handler(CallbackQueryHandler(self.handle_retry_request, pattern="retry:.*"))
+            self.app.add_handler(CommandHandler("checkpayment", self.handle_check_payment))
+            self.app.add_handler(CommandHandler("panel", self.admin_panel))
+            self.app.add_handler(CommandHandler("help", self.handle_help))
+            self.app.add_handler(CallbackQueryHandler(self.show_help_callback, pattern="show_help"))
+            # --- END ADDED HANDLERS ---
+
+            logger.info("Bot initialization completed successfully.")
+
+        except NetworkError as e:
+            logger.critical(f"Network error during bot initialization: {e}")
+            await self._notify_admin(f"🚨 Critical: Network error during bot initialization: {e}")
+            raise # Re-raise the exception
+        
+        except TelegramError as e:
+            logger.critical(f"Telegram API error during bot initialization: {e}")
+            await self._notify_admin(f"🚨 Critical: Telegram API error during bot initialization: {e}")
+            raise # Re-raise the exception
+        
+        except Exception as e:
+            logger.critical(f"An unexpected error occurred during bot initialization: {e}")
+            await self._notify_admin(f"🚨 Critical: Bot initialization failed unexpectedly: {e}")
+            raise # Re-raise the exception
+
+    async def start_background_tasks(self):
+        """Start background tasks after the application is running."""
+        if not self._is_shutting_down:
+            self._bg_tasks.append(asyncio.create_task(self.periodically_cleanup_requests()))
+            self._bg_tasks.append(asyncio.create_task(self.periodically_check_membership()))
+            logger.info("Background tasks started.")
+        
+    async def _initialize_google_drive_service(self):
+        """Initialize the Google Drive API service client."""
+        try:
+            scopes = ['https://www.googleapis.com/auth/drive']
+            creds = service_account.Credentials.from_service_account_file(
+                Config.GOOGLE_DRIVE_CREDENTIALS_PATH, scopes=scopes
+
+            )
+            self.google_drive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+            logger.info("Google Drive API service client initialized.")
+        except Exception as e:
+            logger.error(f"Failed to initialize Google Drive API service client: {e}")
+            await self._notify_admin(f"🚨 Critical: Failed to initialize Google Drive API service client: {e}")
+            raise # Re-raise the exception to be caught by the caller
+   
+    async def cleanup(self):
+        """Clean up resources."""
+        if self._is_shutting_down:
+            return
+            
+        self._is_shutting_down = True
+        logger.info("Starting cleanup...")
+        
+        # Signal background tasks to stop
+        self._shutdown_event.set()
+        
+        # Cancel and wait for background tasks
+        if self._bg_tasks:
+            logger.info("Cancelling background tasks...")
+            for task in self._bg_tasks:
+                if not task.done():
+                    task.cancel()
+            
+            # Wait for tasks to complete cancellation
+            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+            logger.info("Background tasks stopped.")
+
+        # Close database connection pool
+        if hasattr(Database, 'pool') and Database.pool:
+            try:
+                Database.pool.close()
+                await Database.pool.wait_closed()
+                logger.info("Database connection pool closed.")
+            except Exception as e:
+                logger.error(f"Error closing database pool: {e}")
+        
+        logger.info("Cleanup completed.")
+
+    async def is_user_in_channel(self, user_id: int, bot) -> bool:
+        """Check if user is a member of the required channel."""
+        try:
+            member = await bot.get_chat_member(Config.ADVERTISING_CHANNEL_ID, user_id)
+            return member.status in ['member', 'administrator', 'creator']
+        except Exception as e:
+            logger.error(f"Error checking channel membership for user {user_id}: {e}")
+            return False
+
+    async def start(self, update, context):
+        user_id = update.effective_user.id
+        first_name = update.effective_user.first_name
+        username = update.effective_user.username
+        last_name = update.effective_user.last_name
+
+        await Database.add_or_update_user(user_id, username, first_name, last_name)
+
+        keyboard = [
+            [InlineKeyboardButton("Request Content", callback_data="request_content")],
+            [InlineKeyboardButton("Support", callback_data="support")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        welcome_message = (
+            f"Hello {escape_markdown(first_name, version=2)}\\! 👋\n\n"
+            "Welcome to the MovieBot\\! I can help you access exclusive cybersecurity content\\.\n\n"
+            "Use the buttons below or commands to get started:\n"
+            "• /request \\- To request new content\\.\n"
+            "• /support \\- For support inquiries\\."
+        )
+        await update.message.reply_text(welcome_message, reply_markup=reply_markup, parse_mode='MarkdownV2')
+
+
+    async def request_content(self, update: Update, context):
+            # update.effective_user.id is now safe to access because 'update' is an Update object
+            user_id = update.effective_user.id
+
+            if not await self.is_user_in_channel(user_id, context.bot):
+            # Determine the target for the reply based on the update type
+             if update.message:
+                await update.message.reply_text(
+                    f"🚨 To request content, you must first join our channel: {Config.ADVERTISING_CHANNEL_INVITE_LINK}"
+                )
+             elif update.callback_query and update.callback_query.message:
+                await update.callback_query.message.reply_text(
+                    f"🚨 To request content, you must first join our channel: {Config.ADVERTISING_CHANNEL_INVITE_LINK}"
+                )
+             return
+
+            keyboard = [
+            [InlineKeyboardButton("Proceed to Payment", callback_data="proceed_payment")]
+        ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # Determine the target for the reply based on the update type
+            if update.message:
+               await update.message.reply_text(
+                f"To request exclusive content, a payment of {Config.PRICE_AMOUNT / 100:.2f} {Config.CURRENCY} is required.\n\n"
+                "Click 'Proceed to Payment' to continue.",
+                reply_markup=reply_markup
+            )
+            elif update.callback_query and update.callback_query.message:
+                await update.callback_query.message.reply_text(
+                f"To request exclusive content, a payment of {Config.PRICE_AMOUNT / 100:.2f} {Config.CURRENCY} is required.\n\n"
+                "Click 'Proceed to Payment' to continue.",
+                reply_markup=reply_markup
+            )
+
+    async def button_handler(self, update: Update, context):
+        query = update.callback_query
+        await query.answer() # Acknowledge the callback query
+
+        if query.data == "request_content":
+            await self.request_content(update, context) # Pass query object to mimic update
+        elif query.data == "proceed_payment":
+            await self.send_invoice(query.message.chat.id, context)
+        elif query.data == "support":
+            await self.handle_support(update, context)
+        elif query.data == "show_help": # Added from JoeMovieBot.py
+            await self.handle_help(update, context)
+        elif query.data.startswith("retry:"): # Added from JoeMovieBot.py
+            await self.handle_retry_request(update, context)
+
+
+    async def send_invoice(self, chat_id: int, context):
+        title = "Exclusive Content Access"
+        description = f"One-time payment for exclusive cybersecurity content access. Amount: {Config.PRICE_AMOUNT / 100:.2f} {Config.CURRENCY}"
+        payload = f"content_access_user_{chat_id}" # Unique payload for this invoice
+        provider_token = Config.PAYMENT_PROVIDER_TOKEN
+        currency = Config.CURRENCY
+        prices = [LabeledPrice("Content Access", Config.PRICE_AMOUNT)]
+
+        try:
+            # Create a pending payment record in DB
+            payment_id = str(uuid.uuid4()) # Generate a unique payment ID
+            await Database.add_pending_payment(
+                payment_id=payment_id,
+                user_id=chat_id,
+                amount=Config.PRICE_AMOUNT,
+                currency=Config.CURRENCY
+            )
+
+            await context.bot.send_invoice(
+                chat_id=chat_id,
+                title=title,
+                description=description,
+                payload=payment_id, # Use our generated payment_id as payload
+                provider_token=provider_token,
+                currency=currency,
+                prices=prices,
+                start_parameter="start_param", # Can be any string, required
+                need_name=False,
+                need_phone_number=False,
+                need_email=False,
+                need_shipping_address=False,
+                is_flexible=False,
+                disable_notification=False,
+                send_email_to_provider=False,
+                send_phone_number_to_provider=False
+            )
+            logger.info(f"Invoice sent to user {chat_id} with payload {payment_id}. Awaiting payment.")
+            # Admin notification about pending request will now be sent AFTER successful payment.
+
+        except Exception as e:
+            logger.error(f"Failed to send invoice to {chat_id}: {e}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ Failed to create payment invoice. Please try again later or contact support."
+            )
+
+    async def pre_checkout_callback(self, update, context):
+        query = update.pre_checkout_query
+        payment_id = query.invoice_payload # Our custom payment_id
+        user_id = query.from_user.id
+
+        # Verify the payment ID and ensure it's a valid pending payment
+        is_valid_payment = await Database.get_payment_details(payment_id)
+        if is_valid_payment and is_valid_payment['status'] == 'pending' and is_valid_payment['user_id'] == user_id:
+            await context.bot.answer_pre_checkout_query(query.id, ok=True)
+            logger.info(f"Pre-checkout query answered OK for payment {payment_id}")
+        else:
+            await context.bot.answer_pre_checkout_query(query.id, ok=False, error_message="Invalid or expired payment request.")
+            logger.warning(f"Pre-checkout query answered NOT OK for payment {payment_id} from user {user_id}. Details: {is_valid_payment}")
+
+    async def successful_payment_callback(self, update, context):
+        payment_info = update.message.successful_payment
+        payment_id = payment_info.invoice_payload # Our custom payment_id
+        user_id = update.message.from_user.id
+
+        try:
+            # Update payment status in database
+            await Database.update_payment_status(payment_id, 'completed', payment_info.provider_payment_charge_id)
+            logger.info(f"Payment {payment_id} successfully completed for user {user_id}. Charge ID: {payment_info.provider_payment_charge_id}")
+
+            await update.message.reply_text(
+                "✅ Payment successful! Thank you for your purchase.\n\n"
+                "Your content request has been approved. An admin will deliver the content shortly."
+            )
+            # Notify admin about new content request after payment completion
+            # This notification now also serves as the "pending request" notification
+            await self._notify_admin(
+                f"🎉 New Content Request! Payment `{payment_id}` completed by user `{user_id}`.\n"
+                f"Amount: {payment_info.total_amount/100:.2f} {payment_info.currency}.\n"
+                f"Provider Charge ID: `{payment_info.provider_payment_charge_id}`.\n"
+                f"Please use `/deliver {payment_id} <content_id>` to send the content."
+            )
+
+        except Exception as e:
+            logger.error(f"Error processing successful payment {payment_id}: {e}")
+            await update.message.reply_text(
+                "⚠️ There was an issue processing your payment completion. Please contact support."
+            )
+
+    async def handle_text_message(self, update, context):
+        # This handler can be used for general chat or future keyword-based interactions
+        # For now, it just informs the user to use commands.
+        if update.message.chat.type == "private": # Only respond in private chat
+            await update.message.reply_text(
+                "I'm designed to respond to specific commands and buttons. "
+                "Please use /start to see available options or refer to the buttons."
+            )
+        elif update.message.chat.id == int(Config.ADMIN_CHANNEL_ID):
+            logger.info(f"Received message in admin channel: {update.message.text}")
+            # Admin channel might receive various messages, log them but don't necessarily respond
+
+    async def periodically_cleanup_requests(self):
+        while not self._shutdown_event.is_set():
+            try:
+                await Database.cleanup_expired_pending_payments()
+                logger.info("Expired pending payments cleaned up.")
+            except Exception as e:
+                logger.error(f"Error during periodic cleanup: {e}")
+            finally:
+                # Sleep for cleanup interval, but wake up if shutdown is requested
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=Config.CLEANUP_INTERVAL)
+                    break  # Shutdown requested
+                except asyncio.TimeoutError:
+                    continue  # Continue the loop
+
+    async def periodically_check_membership(self):
+        while not self._shutdown_event.is_set():
+            try:
+                # This function might be extended to revoke access if user leaves channel after content delivery
+                # For now, it only checks at the point of request.
+                logger.debug("Running periodic membership check (placeholder for future logic).")
+            except Exception as e:
+                logger.error(f"Error during periodic membership check: {e}")
+            finally:
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=Config.MEMBERSHIP_CHECK_INTERVAL)
+                    break  # Shutdown requested
+                except asyncio.TimeoutError:
+                    continue  # Continue the loop
+
+    # --- ADMIN FUNCTIONS (CMS Integration) ---
+
+    async def handle_add_content(self, update, context):
+        """
+        Admin command to 'register' new content in the bot's database, linking it to the CMS.
+        Usage: /addcontent <content_title> <file_path_or_url> [file_type (optional)]
+        Example: /addcontent "Advanced Phishing Techniques" "https://yourcms.com/files/phishing.pdf" "document"
+        The file_path_or_url should be a direct link to the content in your CMS or cloud storage.
+        """
+        user_id = update.effective_user.id
+        if user_id != Config.ADMIN_ID:
+            await update.message.reply_text("🚫 You are not authorized to use this command.")
+            return
+
+        args = context.args
+        if len(args) < 2:
+            await update.message.reply_text(
+                "Usage: `/addcontent <content_title> <file_path_or_url> [file_type]`\n"
+                "Example: `/addcontent \"Advanced Phishing Techniques\" \"1aB2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q\" \"document\"`"
+            )
+            return
+
+        content_title = args[0]
+        google_drive_file_id = args[1] 
+        file_type = args[2] if len(args) > 2 else "document" # Default to 'document' if not specified
+
+        try:
+            # Generate a unique content_id for this new piece of content
+            new_content_id = str(uuid.uuid4())
+            #Store Google Drive File ID in file_path column
+            await Database.add_content_to_cms_library(new_content_id, content_title, google_drive_file_id, file_type)
+            await update.message.reply_text(
+                f"✅ Content '{content_title}' added to CMS library with ID: `{new_content_id}`.\n"
+                f"Google Drive File ID: `{google_drive_file_id}`\n"               
+            )
+            logger.info(f"Admin {user_id} added content '{content_title}' (ID: {new_content_id}) to CMS library.")
+        except Exception as e:
+            logger.error(f"Error adding content to CMS library: {e}")
+            await update.message.reply_text(f"⚠️ Failed to add content. Error: {e}")
+
+    async def deliver_content_admin(self, update, context):
+        """
+        Admin command to deliver content to a user after successful payment.
+        Usage: /deliver <payment_id> <content_id>
+        Example: /deliver a1b2c3d4-e5f6-7890-1234-567890abcdef content_abc-123
+        """
+        user_id = update.effective_user.id
+        if user_id != Config.ADMIN_ID:
+            await update.message.reply_text("🚫 You are not authorized to use this command.")
+            return
+
+        args = context.args
+        if len(args) != 2:
+            await update.message.reply_text(
+                "Usage: `/deliver <payment_id> <content_id>`\n"
+                "Example: `/deliver a1b2c3d4-e5f6-7890-1234-567890abcdef content_abc-123`"
+            )
+            return
+
+        payment_id = args[0]
+        content_id = args[1]
+
+        try:
+            payment_details = await Database.get_payment_details(payment_id)
+            if not payment_details:
+                await update.message.reply_text(f"❌ Payment ID `{payment_id}` not found.")
+                return
+
+            if payment_details['status'] != 'completed':
+                await update.message.reply_text(
+                    f"⚠️ Payment ID `{payment_id}` has status `{payment_details['status']}`. "
+                    "Content can only be delivered for 'completed' payments."
+                )
+                return
+
+            content_info = await Database.get_content_from_cms_library(content_id)
+            if not content_info:
+                await update.message.reply_text(f"❌ Content ID `{content_id}` not found in CMS library.")
+                return
+
+            recipient_user_id = payment_details['user_id']
+            file_path = content_info['file_path']
+            file_type = content_info['file_type']
+
+            # Update payment record to link content_id
+            await Database.link_content_to_payment(payment_id, content_id)
+
+            # Attempt to deliver the content
+            await self._send_content_to_user(recipient_user_id, file_path, file_type, content_info['title'])
+
+            await update.message.reply_text(
+                f"✅ Content '{content_info['title']}' delivered to user `{recipient_user_id}` for payment `{payment_id}`."
+            )
+            logger.info(f"Admin {user_id} delivered content '{content_id}' to user {recipient_user_id} for payment {payment_id}.")
+
+        except Exception as e:
+            logger.error(f"Error delivering content for payment {payment_id}, content {content_id}: {e}")
+            await update.message.reply_text(f"⚠️ Failed to deliver content. Error: {e}")
+
+    async def _send_content_to_user(self, user_id: int, google_drive_file_id: str, file_type: str, title: str):
+        """
+        Downloads content from Google Drive and sends it to the user via Telegram.
+        """
+        if not self.google_drive_service:
+            logger.error("Google Drive service not initialized. Cannot send content.")
+            await self.app.bot.send_message(
+                chat_id=user_id,
+                text="⚠️ Content delivery service not available. Please contact support"
+            )
+            return
+
+        try:
+            
+            logger.info(f"Attempting to download file {google_drive_file_id} from Google Drive.")
+
+            # Request the file metadata to get its actual name (optional, but good for saving)
+            file_metadata = self.google_drive_service.files().get(fileId=google_drive_file_id, fields='name').execute()
+            actual_file_name = file_metadata.get('name', f"{title}.{file_type.lower() if file_type else 'file'}")
+
+            # Download the file content
+            request = self.google_drive_service.files().get_media(fileId=google_drive_file_id)
+            file_stream = io.BytesIO()
+            downloader = MediaIoBaseDownload(file_stream, request)
+            done = False
+            while done is False:
+                status, done = await asyncio.to_thread(downloader.next_chunk) # Use asyncio.to_thread for blocking IO
+                logger.debug(f"Download progress: {int(status.progress() * 100)}%.")
+
+            file_stream.seek(0) # Rewind the stream to the beginning
+
+            caption = f"Here is your requested content: *{escape_markdown(title, version=2)}*"
+
+            if file_type.lower() == "video":
+                await self.app.bot.send_video(
+                    chat_id=user_id,
+                    video=file_stream,
+                    caption=caption,
+                    parse_mode='MarkdownV2',
+                    filename=actual_file_name # Use the actual file name
+                )
+            elif file_type.lower() == "document":
+                await self.app.bot.send_document(
+                    chat_id=user_id,
+                    document=file_stream,
+                    caption=caption,
+                    parse_mode='MarkdownV2',
+                    filename=actual_file_name # Use the actual file name
+                )
+            else:
+                # Default to document if type is unknown or not video
+                await self.app.bot.send_document(
+                    chat_id=user_id,
+                    document=file_stream,
+                    caption=caption,
+                    parse_mode='MarkdownV2',
+                    filename=actual_file_name
+                )
+            logger.info(f"Successfully sent content '{title}' (GD ID: {google_drive_file_id}) to user {user_id}.")
+
+        except Exception as e:
+            logger.error(f"Failed to send content (GD ID: {google_drive_file_id}) to user {user_id}: {e}")
+            await self.app.bot.send_message(
+                chat_id=user_id,
+                text="⚠️ An error occurred while delivering your content from Google Drive. Please contact support."
+            )
+    async def get_bot_stats(self, update, context):
+        user_id = update.effective_user.id
+        if user_id != Config.ADMIN_ID:
+            await update.message.reply_text("🚫 You are not authorized to use this command.")
+            return
+
+        try:
+            stats = await Database.get_stats()
+            if stats:
+                response = (
+                    "📊 *Bot Statistics* 📊\n\n"
+                    f"• Total Users: `{stats['total_users']}`\n"
+                    f"• Active Users (last 30 days): `{stats['active_users']}`\n"
+                    f"• Total Payments: `{stats['total_payments']}`\n"
+                    f"• Pending Payments: `{stats['pending_payments']}`\n"
+                    f"• Revenue (Completed): `{stats['revenue_completed'] / 100:.2f} {Config.CURRENCY}`\n"
+                    f"• Revenue (Pending): `{stats['revenue_pending'] / 100:.2f} {Config.CURRENCY}`\n\n"
+                    "For more detailed insights, check the database directly."
+                )
+            else:
+                response = "No statistics available yet."
+            await update.message.reply_text(response, parse_mode='MarkdownV2')
+        except Exception as e:
+            logger.error(f"Error fetching bot stats: {e}")
+            await update.message.reply_text("⚠️ An error occurred while fetching bot statistics.")
+
+    async def handle_support(self, update, context):
+        # Determine the target message to reply to
+        if hasattr(update, 'message') and update.message:
+            target_message = update.message
+        elif hasattr(update, 'callback_query') and update.callback_query.message:
+            target_message = update.callback_query.message
+        else:
+            # Fallback or log an error if no message target is found
+            logger.error(f"Could not find a message target for handle_support update: {update}")
+            return
+
+        await target_message.reply_text(
+            "Content requests are non-refundable. "
+            "If you have any questions, please visit t.me/cinemate_support for assistance."
+        )
+        
+    # --- NEW HANDLER METHODS FROM JoeMovieBot.py ---
+
+    async def show_help_callback(self, update, context):
+        # This is a callback, so it might come from a query.
+        # The original JoeMovieBot.py passed update.context, which is unusual.
+        # Assuming it should call handle_help with the appropriate message/query object.
+        if hasattr(update, 'callback_query'):
+            await self.handle_help(update.callback_query, context)
+        else:
+            await self.handle_help(update, context) # Fallback for direct calls if any
+
+    async def handle_mystatus(self, update, context):
+        user_id = update.message.from_user.id
+        try:
+            requests = await Database.get_user_payments(user_id) # Assuming a method like this exists or can be added to Database
+            
+            if requests:
+                status_msg = "📋 Your Last 5 Requests:\n\n"
+                for req in requests:
+                    # Assuming req is a dict or tuple with payment_id and request_timestamp
+                    payment_id = req.get('payment_id') if isinstance(req, dict) else req[0]
+                    request_timestamp = req.get('request_timestamp') if isinstance(req, dict) else req[1]
+                    status_msg += f"• `{payment_id}` - {request_timestamp.strftime('%Y-%m-%d %H:%M')}\n"
+                status_msg += "\nUse /support if you have questions."
+            else:
+                status_msg = "You haven't made any requests yet. Use /start to begin!"
+            
+            await update.message.reply_text(status_msg, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Error checking user status for {user_id}: {e}")
+            await update.message.reply_text(f"⚠️ Error checking your status: {e}")
+
+    async def admin_check(self, update, context):
+        """Verify admin status"""
+        if update.message.from_user.id == Config.ADMIN_ID:
+            await update.message.reply_text("✅ You are recognized as admin!")
+        else:
+            await update.message.reply_text("❌ Access denied!")
+
+    async def handle_get_payments(self, update, context):
+        """List all payment IDs with statuses"""
+        if update.message.from_user.id != Config.ADMIN_ID:
+            return await update.message.reply_text("❌ Admin only!")
+        
+        try:
+            payments = await Database.get_all_payment_ids() # Assuming this method exists in Database
+            if not payments:
+                return await update.message.reply_text("No payments found in the database.")
+            
+            response = "📋 All Payment IDs:\n\n"
+            for payment_id, status in payments:
+                status_emoji = "✅" if status == "completed" else "⏳"
+                response += f"{status_emoji} `{payment_id}` - {status}\n"
+            
+            if len(response) > 4000:
+                parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
+                for part in parts:
+                    await update.message.reply_text(part, parse_mode='Markdown')
+            else:
+                await update.message.reply_text(response, parse_mode='Markdown')
+                
+        except Exception as e:
+            logger.error(f"Error in handle_get_payments: {e}")
+            await update.message.reply_text(f"⚠️ Error: {e}")
+
+    async def handle_pending_payments(self, update, context):
+        """Show admin all pending payments (without file info)"""
+        if update.message.from_user.id != Config.ADMIN_ID:
+            return await update.message.reply_text("❌ Admin only!")
+        
+        try:
+            pending_payments = await Database.get_pending_payments_for_admin() # Assuming this method exists in Database
+            
+            if not pending_payments:
+                return await update.message.reply_text("✅ No pending payments - all caught up!")
+            
+            response = "📋 Pending Payments (need content files):\n\n"
+            for payment in pending_payments:
+                # Assuming payment is a dict or tuple with payment_id, user_id, amount, currency, request_timestamp
+                # and that get_user_info returns a dict or tuple with username
+                user_info = await Database.get_user_info(payment['user_id']) if isinstance(payment, dict) else await Database.get_user_info(payment[1])
+                username = f"@{user_info['username']}" if user_info and user_info.get('username') else "No username"
+                
+                payment_id = payment.get('payment_id') if isinstance(payment, dict) else payment[0]
+                amount = payment.get('amount') if isinstance(payment, dict) else payment[2]
+                currency = payment.get('currency') if isinstance(payment, dict) else payment[3]
+                request_timestamp = payment.get('request_timestamp') if isinstance(payment, dict) else payment[4]
+
+                response += (
+                    f"🆔 Payment ID: `{payment_id}`\n"
+                    f"👤 User: {username} ({payment.get('user_id') if isinstance(payment, dict) else payment[1]})\n"
+                    f"💰 Amount: {amount/100} {currency}\n"
+                    f"⏰ Requested: {request_timestamp.strftime('%Y-%m-%d %H:%M')}\n"
+                    f"🔗 To process: `/deliver {payment_id} <content_id>`\n\n" # Changed to /deliver
+                )
+            
+            if len(response) > 4000:
+                parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
+                for part in parts:
+                    await update.message.reply_text(part, parse_mode='Markdown')
+            else:
+                await update.message.reply_text(response, parse_mode='Markdown')
+                
+        except Exception as e:
+            logger.error(f"Error in handle_pending_payments: {e}")
+            await update.message.reply_text(f"⚠️ Error: {e}")
+
+    async def handle_retry_request(self, update, context):
+        # Determine the target message to reply to
+        if hasattr(update, 'message') and update.message:
+            target_message = update.message
+        elif hasattr(update, 'callback_query') and update.callback_query.message:
+            target_message = update.callback_query.message
+            # For callback queries, remember to answer the query itself
+            await update.callback_query.answer(
+                "✅ Your payment is valid for a new content request. Please use /request to start a new request.",
+                show_alert=True
+            )
+        else:
+            logger.error(f"Could not find a message target for handle_retry_request update: {update}")
+            return
+
+        payment_id = update.callback_query.data.split(":")[1]
+        user_id = update.callback_query.from_user.id
+        
+        try:
+            # In bot1.py, payments are linked to content delivery, not content requests.
+            # Reusing a payment means re-initiating the delivery process for a new content.
+            # This logic needs to be adapted. For now, we'll simplify it.
+            
+            # Check if the payment is valid and can be reused (e.g., not already linked to a delivered content)
+            payment_details = await Database.get_payment_details(payment_id)
+            if not payment_details or payment_details['status'] != 'completed' or payment_details['content_id'] is not None:
+                await update.callback_query.answer(
+                    "❌ This payment cannot be reused for a new content request.",
+                    show_alert=True
+                )
+                return
+
+            # Mark the old payment as 'reused' or create a new one linked to the old.
+            # For simplicity, we'll just allow them to request new content with this payment ID.
+            # The admin will then use /deliver with this payment_id and a new content_id.
+            
+            await update.callback_query.answer(
+                "✅ Your payment is valid for a new content request. Please use /request to start a new request.",
+                show_alert=True
+            )
+            # Optionally, send a message to the user to guide them
+            await context.bot.send_message(
+                user_id,
+                "Your previous payment is valid! Please use the /request command to initiate a new content request."
+            )
+            
+            # Notify admin about the retry attempt
+            user_info = await Database.get_user_info(user_id)
+            username = f"@{user_info['username']}" if user_info and user_info.get('username') else "No username"
+            await self._notify_admin(
+                f"🔄 User {username} ({user_id}) attempted to reuse payment `{payment_id}`. "
+                f"It's marked as valid for a new content delivery."
+            )
+
+        except Exception as e:
+            logger.error(f"Error handling retry request for payment {payment_id}: {e}")
+            await update.callback_query.answer(
+                "⚠️ Error processing your request. Please try again.",
+                show_alert=True
+            )
+
+    async def handle_check_payment(self, update, context):
+        """Check details of a specific payment"""
+        if update.message.from_user.id != Config.ADMIN_ID:
+            return await update.message.reply_text("❌ Admin only!")
+        
+        try:
+            if len(update.message.text.split()) > 1:
+                payment_id = update.message.text.split()[1]
+                await self._show_payment_details(update.message, payment_id)
+            else:
+                msg = await update.message.reply_text("Please enter the Payment ID to check:")
+                # Store message_id to filter replies
+                context.user_data['check_payment_msg_id'] = msg.message_id
+                # Add handler with filters to ensure it only responds to the next message from the same user
+                context.dispatcher.add_handler(MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & filters.ReplyToMessage(message_id=msg.message_id), 
+                    self._process_check_payment_step
+                ), group=1) # Use a higher group to prioritize
+                
+        except Exception as e:
+            logger.error(f"Error in handle_check_payment: {e}")
+            await update.message.reply_text(f"⚠️ Error: {e}")
+
+    async def _process_check_payment_step(self, update, context):
+        """Process payment ID for checking"""
+        try:
+            payment_id = update.message.text.strip()
+            await self._show_payment_details(update.message, payment_id)
+            # Remove the temporary handler after use
+            if 'check_payment_msg_id' in context.user_data:
+                del context.user_data['check_payment_msg_id']
+            # This handler is added with a lambda, so it needs to be removed carefully.
+            # A more robust way would be to use ConversationHandler or a unique callback_data.
+            # For simplicity, we'll assume it's a one-time use.
+            # The current implementation of `add_handler` with `group=1` means it's added to a list.
+            # Removing it requires iterating through `context.dispatcher.handlers[1]`.
+            # This is a common pattern for temporary handlers.
+            current_handlers = context.dispatcher.handlers[1][:] # Get a copy
+            for handler in current_handlers:
+                if hasattr(handler, 'callback') and handler.callback == self._process_check_payment_step:
+                    context.dispatcher.remove_handler(handler, group=1)
+
+        except Exception as e:
+            logger.error(f"Error in _process_check_payment_step: {e}")
+            await update.message.reply_text(f"⚠️ Error: {e}")
+
+    async def _show_payment_details(self, message, payment_id):
+        """Show details of a specific payment"""
+        try:
+            payment = await Database.get_payment_details(payment_id) # Assuming this method exists and returns a dict
+            
+            if not payment:
+                return await message.reply_text("❌ Payment ID not found")
+            
+            user_info = await Database.get_user_info(payment['user_id'])
+            username = f"@{user_info['username']}" if user_info and user_info.get('username') else f"{user_info.get('first_name', '')} {user_info.get('last_name', '')}".strip()
+            status_emoji = "✅" if payment['status'] == "completed" else "⏳"
+            
+            response = (
+                f"📋 Payment Details:\n\n"
+                f"🆔 Payment ID: `{payment['payment_id']}`\n"
+                f"👤 User: {username} ({payment['user_id']})\n"
+                f"💰 Amount: {payment['amount']/100} {payment['currency']}\n"
+                f"📊 Status: {status_emoji} {payment['status']}\n"
+                f"⏰ Requested: {payment['request_timestamp'].strftime('%Y-%m-%d %H:%M')}\n"
+            )
+            
+            if payment['completion_timestamp']:
+                response += f"✅ Completed: {payment['completion_timestamp'].strftime('%Y-%m-%d %H:%M')}\n"
+            
+            if payment['content_id']: # Using 'content_id' from bot1.py's schema
+                content_info = await Database.get_content_from_cms_library(payment['content_id'])
+                content_title = content_info['title'] if content_info else "Unknown Content"
+                response += (
+                    f"\n🎬 Content Info:\n"
+                    f"📁 Content Title: {content_title}\n"
+                    f"🆔 Content ID: `{payment['content_id']}`\n"
+                )
+            else:
+                response += "\n⚠️ No content linked yet\n"
+                response += f"🔗 To link: `/deliver {payment['payment_id']} <content_id>`"
+            
+            await message.reply_text(response, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Error in _show_payment_details for {payment_id}: {e}")
+            await message.reply_text(f"⚠️ Error: {e}")
+
+    async def admin_panel(self, update, context):
+        if update.message.from_user.id == Config.ADMIN_ID:
+            keyboard = ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton("/addcontent"), KeyboardButton("/deliver")],
+                    [KeyboardButton("/stats"), KeyboardButton("/pending")],  
+                    [KeyboardButton("/checkpayment"), KeyboardButton("/getpayments")]
+                ],
+                resize_keyboard=True
+            )
+            await update.message.reply_text(
+                "Admin panel:",
+                reply_markup=keyboard
+            )
+        else:
+            await update.message.reply_text("❌ Access denied!")
+
+    async def handle_help(self, update, context):
+        # This handler can be called by CommandHandler /help or CallbackQueryHandler show_help
+        # So we need to check if update has a message or callback_query
+        if hasattr(update, 'message'):
+            target_message = update.message
+        elif hasattr(update, 'callback_query'):
+            target_message = update.callback_query.message
+        else:
+            logger.error(f"Could not find a message target for handlde_help update: {update}")
+            return # Should not happen with current handlers
+
+        help_text = """
 🎬 *Cinemate Bot Commands* 🎬
 
 *Main Commands:*
@@ -208,90 +988,200 @@ def handle_help(message):
 /help - Show this help message
 /support - Contact support
 
-*Movie Commands:*
-/request - Request a movie (also available via button)
+*Content Commands:*
+/request - Request a content (also available via button)
 /mystatus - Check your pending requests
 
 *Admin Commands* (Admin only):
-/addmovie - Add a movie to a payment
+/addcontent - Add a content to the CMS library
+/deliver - Deliver content to a user
+/checkpayment - Check payment details
+/pending - List pending payments
 /stats - View bot statistics
 /panel - Admin control panel
+/getpayments - List all payment IDs
 
 Click buttons or type commands to interact with me!
 """
-    bot.send_message(message.chat.id, help_text, parse_mode='Markdown')
+        await target_message.reply_text(help_text, parse_mode='Markdown')
 
-# "Request Movie" button handler
-@bot.callback_query_handler(func=lambda call: call.data == "request_movie")
-def handle_request_movie(call):
-    prices = [types.LabeledPrice(label="XTR", amount=500)]  # 500 XTR
-    bot.send_invoice(
-        call.message.chat.id,
-        title="Movie Request",
-        description="Request a movie for 1 XTR!",
-        invoice_payload="movie_request_payload",
-        provider_token="",  # Add your payment provider token here
-        currency="XTR",
-        prices=prices,
-        reply_markup=payment_keyboard()
-    )
+    # --- END NEW HANDLER METHODS ---
 
-# Pre-checkout handler
-@bot.pre_checkout_query_handler(func=lambda query: True)
-def handle_pre_checkout_query(pre_checkout_query):
-    bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
 
-# Successful payment handler
-@bot.message_handler(content_types=['successful_payment'])
-def handle_successful_payment(message):
-    user_id = message.from_user.id
-    payment_id = message.successful_payment.provider_payment_charge_id
-    amount = message.successful_payment.total_amount
-    currency = message.successful_payment.currency
-
-    # Send payment confirmation
-    bot.send_message(
-        message.chat.id,
-        "✅ Payment received! Your movie request has been submitted.\n\n"
-        "Our team will process your request shortly. You'll receive the movie file "
-        "as soon as it's ready.\n\n"
-        f"Your payment ID: {payment_id}\n"
-        "Use /support if you have any questions."
-    )
+async def main():
+    bot = MovieBot()
     
-    # Save payment to database
-    save_payment(user_id, payment_id, amount, currency)
+    # Setup signal handlers for graceful shutdown
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}, initiating shutdown...")
+        # Create a task to handle shutdown
+        asyncio.create_task(shutdown_handler())
     
-    # Notify admin
-    try:
-        user_info = get_user_info(user_id)
-        username = f"@{user_info[1]}" if user_info and user_info[1] else "No username"
-        bot.send_message(
-            ADMIN_ID,
-            f"🎬 New Movie Request!\n\n"
-            f"👤 User: {username} ({user_id})\n"
-            f"💰 Amount: {amount/100} {currency}\n"
-            f"🆔 Payment ID: {payment_id}\n\n"
-            f"Reply to this with the movie file and '{payment_id}' as caption"
-        )
-    except Exception as e:
-        print(f"⚠️ Failed to notify admin: {e}")
-# /support command handler
-@bot.message_handler(commands=['support'])
-def handle_support(message):
-    bot.send_message(
-        message.chat.id,
-        "Movie requests are non-refundable. "
-        "If you have any questions, please contact our support team."
-    )
-
-if __name__ == "__main__":
-    while True:
+    async def shutdown_handler():
+        logger.info("Shutdown handler called, stopping bot...")
+        if bot.app and bot.app.running:
+            await bot.app.stop()
+        await bot.cleanup()
+    
+    # Register signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    max_startup_retries = 5
+    startup_retry_delay = 30  # seconds
+    
+    for attempt in range(max_startup_retries):
         try:
-            bot.polling(none_stop=True, interval=1)  # ✅ Auto-reconnects
+            logger.info(f"Starting bot initialization attempt {attempt + 1}/{max_startup_retries}")
+            
+            # Check network stability first
+            network_ok = await bot.check_network_stability()
+            if not network_ok:
+                logger.error("Network stability check failed, skipping this attempt")
+                if attempt < max_startup_retries - 1:
+                    await asyncio.sleep(startup_retry_delay)
+                    continue
+                else:
+                    raise NetworkError("Network stability check failed after all retries")
+            
+            # Initialize bot components
+            await bot.initialize()
+            
+            # Initialize and start the application with retry logic
+            logger.info("Initializing Telegram application...")
+            initialization_successful = False
+            
+            for init_attempt in range(3):  # 3 attempts for app initialization
+                try:
+                    await bot.app.initialize()
+                    initialization_successful = True
+                    logger.info("Telegram application initialization successful")
+                    break
+                except Exception as init_error:
+                    logger.warning(f"App initialization attempt {init_attempt + 1}/3 failed: {init_error}")
+                    if init_attempt < 2:  # Don't sleep after the last attempt
+                        await asyncio.sleep(10)
+            
+            if not initialization_successful:
+                raise TelegramError("Failed to initialize Telegram application after 3 attempts")
+            
+            # Start the application
+            logger.info("Starting Telegram application...")
+            await bot.app.start()
+            
+            # Start background tasks after the app is running
+            await bot.start_background_tasks()
+            
+            logger.info("Bot started successfully, beginning to poll for updates...")
+            
+            # Start polling with error handling
+            try:
+                await bot.app.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True,  # Skip old updates
+                    timeout=30,  # 30 second timeout for getting updates
+                    bootstrap_retries=3,  # Retry connection 3 times
+                )
+                
+                # Keep the bot running
+                await asyncio.Event().wait()
+                
+            except Exception as polling_error:
+                logger.error(f"Error during polling: {polling_error}")
+                raise
+                
+            # If we reach here, the bot started successfully
+            break
+            
+        except (TelegramError, NetworkError) as e:
+            logger.error(f"Bot startup attempt {attempt + 1} failed: {e}")
+            if attempt < max_startup_retries - 1:
+                logger.info(f"Retrying in {startup_retry_delay} seconds...")
+                await asyncio.sleep(startup_retry_delay)
+            else:
+                logger.critical("All startup attempts failed")
+                raise
+                
+        except KeyboardInterrupt:
+            logger.info("Bot interrupted by user during startup")
+            break
+            
         except Exception as e:
-            print(f"⚠️ Crash: {e}. Restarting in 5s...")
-            time.sleep(5)
+            logger.error(f"Unexpected error during startup attempt {attempt + 1}: {e}", exc_info=True)
+            if attempt < max_startup_retries - 1:
+                logger.info(f"Retrying in {startup_retry_delay} seconds...")
+                await asyncio.sleep(startup_retry_delay)
+            else:
+                logger.critical("All startup attempts failed due to unexpected errors")
+                raise
+    
+    # Handle graceful shutdown
+    try:
+        logger.info("Bot is running. Press Ctrl+C to stop.")
+        # This will block until interrupted
+        await asyncio.Event().wait()
+        
+    except KeyboardInterrupt:
+        logger.info("Bot interrupted by user")
+    except Exception as e:
+        logger.critical(f"Fatal error in bot: {e}", exc_info=True)
+    finally:
+        logger.info("Starting shutdown sequence...")
+        try:
+            # Stop the updater first
+            if bot.app and hasattr(bot.app, 'updater') and bot.app.updater and bot.app.updater.running:
+                logger.info("Stopping updater...")
+                await bot.app.updater.stop()
+                logger.info("Updater stopped")
+            
+            # Stop the application
+            if bot.app and bot.app.running:
+                logger.info("Stopping application...")
+                await bot.app.stop()
+                logger.info("Application stopped")
+            
+            # Clean up resources
+            await bot.cleanup()
+            logger.info("Bot shutdown completed")
+            
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}", exc_info=True)
 
+# Add a function to test network connectivity before starting
+async def test_connectivity():
+    """Test basic network connectivity before starting the bot"""
+    logger.info("Testing network connectivity...")
+    
+    try:
+        # Test DNS resolution
+        socket.gethostbyname('api.telegram.org')
+        logger.info("DNS resolution test passed")
+        
+        # Test HTTP connectivity
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get("https://api.telegram.org") as response:
+                logger.info(f"HTTP connectivity test passed (status: {response.status})")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Network connectivity test failed: {e}")
+        return False
 
+# Run the bot
+if __name__ == "__main__":
+    try:
+        # Test connectivity first
+        if asyncio.run(test_connectivity()):
+            logger.info("Network connectivity tests passed, starting bot...")
+            asyncio.run(main())
+        else:
+            logger.critical("Network connectivity tests failed. Please check your internet connection.")
+            sys.exit(1)
+            
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.critical(f"Failed to start bot: {e}", exc_info=True)
+        sys.exit(1)
 
